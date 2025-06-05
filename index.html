@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>College Space Reservation</title>
+
+  <!-- ===== Bootstrap 4.5 for responsive layout ===== -->
+  <link
+    rel="stylesheet"
+    href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+    integrity="sha384-JcKb8q3iqJ61gNVJ1j8aeqiiFvZH2cJZq4lR6Ck2eBvQx8nHTODeG3swwKbhxQIO"
+    crossorigin="anonymous"
+  />
+
+  <style>
+    body {
+      background: #f8f9fa;
+      padding: 20px;
+    }
+    h2 {
+      margin-bottom: 1.5rem;
+    }
+    .space-card {
+      margin-bottom: 1.5rem;
+      border-radius: 0.25rem;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+    .space-img {
+      object-fit: cover;
+      height: 160px;
+      width: 100%;
+      border-top-left-radius: 0.25rem;
+      border-top-right-radius: 0.25rem;
+    }
+    .slot-btn {
+      margin: 0.2rem;
+      width: 120px;
+    }
+    .badge {
+      font-size: 0.9rem;
+    }
+    .refresh-info {
+      font-size: 0.85rem;
+      color: #555;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2 class="text-center">Reserve College Spaces</h2>
+
+    <!-- 1. Date Picker + “Any Space” Checkbox -->
+    <div class="row mb-4">
+      <div class="col-md-5">
+        <label for="reservation-date" class="font-weight-bold">
+          Select Date (today ↔ +7 days):
+        </label>
+        <input
+          type="date"
+          id="reservation-date"
+          class="form-control"
+          min=""
+          max=""
+          onchange="onDateChange()"
+        />
+        <div id="refresh-status" class="refresh-info">
+          Last updated: --:--:--
+        </div>
+      </div>
+      <div class="col-md-7 d-flex align-items-end">
+        <div class="form-check ml-3">
+          <input
+            class="form-check-input"
+            type="checkbox"
+            id="any-space-checkbox"
+            onchange="onDateChange()"
+          />
+          <label class="form-check-label" for="any-space-checkbox">
+            I’m open to <strong>any</strong> space (hide fully booked rooms)
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. Container for Space Cards -->
+    <div id="spaces-container" class="row">
+      <!-- Cards will be inserted here via JavaScript -->
+    </div>
+  </div>
+
+  <!-- jQuery + Bootstrap JS (for layout, if needed) -->
+  <script
+    src="https://code.jquery.com/jquery-3.5.1.slim.min.js"
+    integrity="sha384-DfXdz2htPH0lsSSs5nCTpuj/zy4C+OGpamoFVy38MVBnE+IbbVYUew+OrCXaRkfj"
+    crossorigin="anonymous"
+  ></script>
+  <script
+    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"
+    integrity="sha384-ootsoM37Gcv2eOGQM90eRE+EI8rB4DxHsQbPtfVUdaVMjzB+0rWjOAtGrZg8BvQ9"
+    crossorigin="anonymous"
+  ></script>
+
+  <script>
+    // ============== CONFIGURATION ==============
+    // (Replace SPREADSHEET_ID with your own, from the Sheet’s URL)
+    const SPREADSHEET_ID    = 'PUT_YOUR_SPREADSHEET_ID_HERE';
+    const SPACES_JSON_URL   = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&sheet=Spaces`;
+    const RESV_JSON_URL     = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&sheet=Reservations`;
+
+    // Paste the Apps Script Web App URL you deployed earlier:
+    const RESERVE_API_URL   = 'PUT_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
+
+    // Polling interval (ms) to refresh data
+    const POLL_INTERVAL_MS  = 7000;
+
+    // ============== GLOBAL STATE ==============
+    let allSpaces          = [];   // array of { name, imageUrl, chairs, ... }
+    let currentReservations= [];   // array of { timeSlot, spaceName } for chosen date
+    let chosenDate         = '';   // “YYYY-MM-DD” string
+    let pollingIntervalId  = null;
+
+    // ============== INITIAL SETUP ==============
+    document.addEventListener('DOMContentLoaded', () => {
+      configureDatePicker();
+      onDateChange(); // load initial data and start polling
+    });
+
+    // Set date input’s min= today, max= today+7, default=today
+    function configureDatePicker() {
+      const dateInput = document.getElementById('reservation-date');
+      const today = new Date();
+      function formatDate(d) {
+        const y = d.getFullYear();
+        const m = ('0' + (d.getMonth() + 1)).slice(-2);
+        const day = ('0' + d.getDate()).slice(-2);
+        return `${y}-${m}-${day}`;
+      }
+      dateInput.min = formatDate(today);
+      const maxD = new Date();
+      maxD.setDate(today.getDate() + 7);
+      dateInput.max = formatDate(maxD);
+
+      // Default = today
+      dateInput.value = formatDate(today);
+      chosenDate = dateInput.value;
+    }
+
+    // ============== WHEN DATE or “ANY SPACE” CHANGES ==============
+    function onDateChange() {
+      chosenDate = document.getElementById('reservation-date').value;
+      // Clear any existing poll, then load once, then start polling
+      if (pollingIntervalId) clearInterval(pollingIntervalId);
+      loadDataAndRender();
+      pollingIntervalId = setInterval(loadDataAndRender, POLL_INTERVAL_MS);
+    }
+
+    // ============ FETCH JSONS then RENDER ===========
+    async function loadDataAndRender() {
+      try {
+        // 1. Fetch “Spaces” JSON
+        const spacesResponse = await fetch(SPACES_JSON_URL);
+        const spacesText = await spacesResponse.text();
+        // Remove the “google.visualization.Query.setResponse(…)” wrapper
+        const spacesJson = JSON.parse(spacesText.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\);/)[1]);
+        allSpaces = parseGvizTable(spacesJson.table);
+
+        // 2. Fetch “Reservations” JSON
+        const resvResponse = await fetch(RESV_JSON_URL);
+        const resvText = await resvResponse.text();
+        const resvJson = JSON.parse(resvText.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\);/)[1]);
+        const allReservations = parseGvizTable(resvJson.table);
+
+        // 3. Filter reservations for chosenDate
+        currentReservations = allReservations.filter(r => r.Date === chosenDate);
+
+        // 4. Render the cards
+        renderSpaceCards();
+
+        // 5. Update timestamp
+        updateRefreshTimestamp();
+      } catch (err) {
+        console.error('Error loading data:', err);
+      }
+    }
+
+    // Parse the “gviz” table into an array of objects:
+    //   table.cols = [ { id, label, …}, … ]
+    //   table.rows = [ { c: [ {v:…}, {v:…}, … ] }, … ]
+    function parseGvizTable(table) {
+      const cols = table.cols.map(col => col.label);
+      const rows = table.rows.map(rowObj => {
+        const row = {};
+        rowObj.c.forEach((cell, i) => {
+          // cell might be null if the cell is blank
+          row[cols[i]] = cell && cell.v !== null ? cell.v : '';
+        });
+        return row;
+      });
+      return rows;
+    }
+
+    // Update “Last updated” label
+    function updateRefreshTimestamp() {
+      const now = new Date();
+      const hh = ('0' + now.getHours()).slice(-2);
+      const mm = ('0' + now.getMinutes()).slice(-2);
+      const ss = ('0' + now.getSeconds()).slice(-2);
+      document.getElementById('refresh-status').innerText =
+        `Last updated: ${hh}:${mm}:${ss}`;
+    }
+
+    // ============== RENDER SPACE CARDS ==============
+    function renderSpaceCards() {
+      const container = document.getElementById('spaces-container');
+      container.innerHTML = ''; // clear
+
+      // “Any Space” toggle
+      const showOnlyAvailable = document.getElementById('any-space-checkbox').checked;
+
+      allSpaces.forEach(space => {
+        // 1. Determine which slots exist on this date:
+        //    - Sunday (day=0): no slots
+        //    - Saturday (day=6): only “8AM-1PM”
+        //    - Weekdays: both “8AM-1PM” and “2PM-6PM”
+        const dt = new Date(chosenDate);
+        const weekday = dt.getDay(); // 0=Sun, 6=Sat
+        let slotsToday = [];
+        if (weekday === 0) {
+          slotsToday = [];
+        } else if (weekday === 6) {
+          slotsToday = ['8AM-1PM'];
+        } else {
+          slotsToday = ['8AM-1PM', '2PM-6PM'];
+        }
+
+        // 2. Find which of those slots are already taken
+        const takenSlots = currentReservations
+          .filter(r => r.SpaceName === space.SpaceName)
+          .map(r => r.TimeSlot);
+
+        // 3. If “Any Space” is checked and *all* slots are taken, skip
+        if (showOnlyAvailable && slotsToday.length > 0 && takenSlots.length === slotsToday.length) {
+          return; // skip rendering this space
+        }
+
+        // 4. Build a Bootstrap card
+        const colDiv = document.createElement('div');
+        colDiv.className = 'col-lg-4 col-md-6';
+
+        const cardDiv = document.createElement('div');
+        cardDiv.className = 'card space-card';
+
+        // 4a. Image
+        const imgEl = document.createElement('img');
+        imgEl.src = space.ImageURL;
+        imgEl.alt = space.SpaceName;
+        imgEl.className = 'card-img-top space-img';
+
+        // 4b. Card body
+        const cardBody = document.createElement('div');
+        cardBody.className = 'card-body';
+
+        const titleEl = document.createElement('h5');
+        titleEl.className = 'card-title';
+        titleEl.innerText = space.SpaceName;
+
+        const detailsEl = document.createElement('p');
+        detailsEl.className = 'card-text';
+        detailsEl.innerHTML = `
+          <strong>Chairs:</strong> ${space.Chairs} <br>
+          <strong>Whiteboards:</strong> ${space.Whiteboards} <br>
+          <strong>Projectors:</strong> ${space.Projectors} <br>
+          <strong>Power Sockets:</strong> ${space.PowerSockets}
+        `;
+
+        // 4c. If Sunday: show “Closed on Sunday” and skip buttons
+        if (slotsToday.length === 0) {
+          const closedEl = document.createElement('div');
+          closedEl.className = 'text-muted font-italic';
+          closedEl.innerText = 'Closed on Sunday';
+          cardBody.appendChild(titleEl);
+          cardBody.appendChild(detailsEl);
+          cardBody.appendChild(closedEl);
+
+          cardDiv.appendChild(imgEl);
+          cardDiv.appendChild(cardBody);
+          colDiv.appendChild(cardDiv);
+          container.appendChild(colDiv);
+          return;
+        }
+
+        // 4d. Badges for “Free”/“Taken”
+        const badgeDiv = document.createElement('div');
+        badgeDiv.className = 'mb-2';
+        slotsToday.forEach(slot => {
+          const badge = document.createElement('span');
+          badge.className = 'badge mr-1';
+          if (takenSlots.includes(slot)) {
+            badge.classList.add('badge-danger');
+            badge.innerText = `${slot} (Taken)`;
+          } else {
+            badge.classList.add('badge-success');
+            badge.innerText = `${slot} (Free)`;
+          }
+          badgeDiv.appendChild(badge);
+        });
+
+        // 4e. Buttons: one “Reserve” per free slot, or “Taken” if not
+        const buttonDiv = document.createElement('div');
+        buttonDiv.className = 'mt-2';
+
+        slotsToday.forEach(slot => {
+          if (takenSlots.includes(slot)) {
+            // Already taken → greyed-out “Taken” button
+            const takenBtn = document.createElement('button');
+            takenBtn.className = 'btn btn-secondary slot-btn';
+            takenBtn.disabled = true;
+            takenBtn.innerText = 'Taken';
+            buttonDiv.appendChild(takenBtn);
+          } else {
+            // Free → active “Reserve” button
+            const reserveBtn = document.createElement('button');
+            reserveBtn.className = 'btn btn-outline-primary slot-btn';
+            reserveBtn.innerText = `Reserve ${formatSlotLabel(slot)}`;
+            reserveBtn.onclick = () => {
+              // (A) Disable immediately so user doesn’t click twice
+              reserveBtn.disabled = true;
+              reserveBtn.innerText = 'Booking…';
+
+              // (B) Prompt for name/email
+              const name = promptUserName();
+              if (!name) {
+                alert('Reservation cancelled: no name entered.');
+                // Refresh data immediately so the button returns to “Free”
+                loadDataAndRender();
+                return;
+              }
+
+              // (C) Submit JSON to our Apps Script endpoint
+              fetch(RESERVE_API_URL, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  date: chosenDate,
+                  timeSlot: slot,
+                  spaceName: space.SpaceName,
+                  reservedBy: name
+                })
+              })
+              .then(response => response.json())
+              .then(json => {
+                if (json.success) {
+                  alert('✅ Reservation confirmed!');
+                } else {
+                  alert('⚠️ ' + (json.message || 'Could not reserve.'));
+                }
+                // Refresh so UI updates (either way)
+                loadDataAndRender();
+              })
+              .catch(err => {
+                console.error('Error calling reserve API:', err);
+                alert('⚠️ Error communicating with server.');
+                loadDataAndRender();
+              });
+            };
+            buttonDiv.appendChild(reserveBtn);
+          }
+        });
+
+        // 4f. Assemble the card
+        cardBody.appendChild(titleEl);
+        cardBody.appendChild(detailsEl);
+        cardBody.appendChild(badgeDiv);
+        cardBody.appendChild(buttonDiv);
+
+        cardDiv.appendChild(imgEl);
+        cardDiv.appendChild(cardBody);
+        colDiv.appendChild(cardDiv);
+        container.appendChild(colDiv);
+      });
+    }
+
+    // ============= HELPERS =============
+    function promptUserName() {
+      const name = prompt(`You selected ${chosenDate}.\nPlease enter your NAME or EMAIL:`, '');
+      return name ? name.trim() : '';
+    }
+    function formatSlotLabel(slot) {
+      return slot.replace('-', '–'); // “8AM-1PM” → “8AM–1PM”
+    }
+  </script>
+</body>
+</html>
